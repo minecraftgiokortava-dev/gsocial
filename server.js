@@ -207,25 +207,26 @@ app.get('/api/users/:id/posts', requireAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  FRIENDS
+//  FRIENDS & FRIEND REQUESTS
 // ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/friends/:id', requireAuth, async (req, res) => {
-  const friendId = parseInt(req.params.id);
-  if (friendId === req.session.userId)
-    return res.status(400).json({ error: "Can't add yourself" });
+
+// GET /api/friends — list confirmed friends
+app.get('/api/friends', requireAuth, async (req, res) => {
   try {
-    await pool.query(
-      `INSERT INTO friendships (user_id1, user_id2)
-       VALUES (least($1::int, $2::int), greatest($1::int, $2::int))
-       ON CONFLICT DO NOTHING`,
-      [req.session.userId, friendId]
+    const { rows } = await pool.query(
+      `SELECT u.id, u.first_name, u.last_name, u.avatar_url
+       FROM friendships f
+       JOIN users u ON u.id = CASE WHEN f.user_id1=$1 THEN f.user_id2 ELSE f.user_id1 END
+       WHERE f.user_id1=$1 OR f.user_id2=$1`,
+      [req.session.userId]
     );
-    res.json({ ok: true });
+    res.json({ friends: rows });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
+// DELETE /api/friends/:id — unfriend
 app.delete('/api/friends/:id', requireAuth, async (req, res) => {
   const friendId = parseInt(req.params.id);
   try {
@@ -240,16 +241,121 @@ app.delete('/api/friends/:id', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/friends', requireAuth, async (req, res) => {
+// GET /api/friends/requests — incoming pending requests for current user
+app.get('/api/friends/requests', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT u.id, u.first_name, u.last_name, u.avatar_url
-       FROM friendships f
-       JOIN users u ON u.id = CASE WHEN f.user_id1=$1 THEN f.user_id2 ELSE f.user_id1 END
-       WHERE f.user_id1=$1 OR f.user_id2=$1`,
+      `SELECT u.id, u.first_name, u.last_name, u.avatar_url, fr.created_at
+       FROM friend_requests fr
+       JOIN users u ON u.id = fr.sender_id
+       WHERE fr.receiver_id = $1 AND fr.status = 'pending'
+       ORDER BY fr.created_at DESC`,
       [req.session.userId]
     );
-    res.json({ friends: rows });
+    res.json({ requests: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/friends/requests/:id — send a friend request to user :id
+app.post('/api/friends/requests/:id', requireAuth, async (req, res) => {
+  const receiverId = parseInt(req.params.id);
+  if (receiverId === req.session.userId)
+    return res.status(400).json({ error: "Can't add yourself" });
+  try {
+    // Check if already friends
+    const existing = await pool.query(
+      `SELECT 1 FROM friendships
+       WHERE user_id1 = least($1::int,$2::int) AND user_id2 = greatest($1::int,$2::int)`,
+      [req.session.userId, receiverId]
+    );
+    if (existing.rowCount) return res.status(400).json({ error: 'Already friends' });
+
+    // Check if request already sent
+    const dup = await pool.query(
+      `SELECT 1 FROM friend_requests
+       WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'`,
+      [req.session.userId, receiverId]
+    );
+    if (dup.rowCount) return res.status(400).json({ error: 'Request already sent' });
+
+    // Check if the other person already sent us a request — auto-accept
+    const reverse = await pool.query(
+      `SELECT id FROM friend_requests
+       WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'`,
+      [receiverId, req.session.userId]
+    );
+    if (reverse.rowCount) {
+      // Auto-accept: create friendship, mark both as accepted
+      await pool.query(
+        `INSERT INTO friendships (user_id1, user_id2)
+         VALUES (least($1::int,$2::int), greatest($1::int,$2::int))
+         ON CONFLICT DO NOTHING`,
+        [req.session.userId, receiverId]
+      );
+      await pool.query(
+        `UPDATE friend_requests SET status='accepted' WHERE id=$1`,
+        [reverse.rows[0].id]
+      );
+      return res.json({ ok: true, auto_accepted: true });
+    }
+
+    await pool.query(
+      `INSERT INTO friend_requests (sender_id, receiver_id) VALUES ($1, $2)`,
+      [req.session.userId, receiverId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/friends/requests/:id/accept — accept incoming request from user :id
+app.post('/api/friends/requests/:id/accept', requireAuth, async (req, res) => {
+  const senderId = parseInt(req.params.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query(
+      `UPDATE friend_requests SET status='accepted'
+       WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'
+       RETURNING id`,
+      [senderId, req.session.userId]
+    );
+    if (!r.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Request not found' });
+    }
+    await client.query(
+      `INSERT INTO friendships (user_id1, user_id2)
+       VALUES (least($1::int,$2::int), greatest($1::int,$2::int))
+       ON CONFLICT DO NOTHING`,
+      [req.session.userId, senderId]
+    );
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/friends/requests/:id/decline — decline/delete request from user :id
+app.post('/api/friends/requests/:id/decline', requireAuth, async (req, res) => {
+  const senderId = parseInt(req.params.id);
+  try {
+    await pool.query(
+      `UPDATE friend_requests SET status='declined'
+       WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'`,
+      [senderId, req.session.userId]
+    );
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
