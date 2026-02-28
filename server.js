@@ -59,7 +59,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use(session({
-  store: new pgSession({ pool, tableName: 'session' }),
+  store: new pgSession({ pool, tableName: 'session', createTableIfMissing: false }),
   secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
   resave: false,
   saveUninitialized: false,
@@ -112,14 +112,21 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user || !(await bcrypt.compare(password, user.password))) return res.status(400).json({ error: 'Invalid email/password' });
     req.session.userId = user.id;
     req.session.save(async () => res.json({ user: await getUser(user.id) }));
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { 
+    res.status(500).json({ error: 'Server error' }); 
+  }
 });
 
-app.post('/api/auth/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
-app.get('/api/auth/me', requireAuth, async (req, res) => { res.json({ user: await getUser(req.session.userId) }); });
+app.post('/api/auth/logout', (req, res) => { 
+  req.session.destroy(() => res.json({ ok: true })); 
+});
+
+app.get('/api/auth/me', requireAuth, async (req, res) => { 
+  res.json({ user: await getUser(req.session.userId) }); 
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  USERS & FRIENDS (NEW SEARCH AND ADD FRIEND LOGIC)
+//  USERS & FRIENDS 
 // ══════════════════════════════════════════════════════════════════════════════
 app.get('/api/users/search', requireAuth, async (req, res) => {
   const { q } = req.query;
@@ -131,7 +138,9 @@ app.get('/api/users/search', requireAuth, async (req, res) => {
       [`%${q}%`, req.session.userId]
     );
     res.json({ users: rows });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { 
+    res.status(500).json({ error: 'Server error' }); 
+  }
 });
 
 app.post('/api/friends/:id', requireAuth, async (req, res) => {
@@ -143,7 +152,9 @@ app.post('/api/friends/:id', requireAuth, async (req, res) => {
       [req.session.userId, friendId]
     );
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { 
+    res.status(500).json({ error: 'Server error' }); 
+  }
 });
 
 app.get('/api/friends', requireAuth, async (req, res) => {
@@ -156,10 +167,14 @@ app.get('/api/friends', requireAuth, async (req, res) => {
       [req.session.userId]
     );
     res.json({ friends: rows });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { 
+    res.status(500).json({ error: 'Server error' }); 
+  }
 });
 
-app.get('/api/users/:id', requireAuth, async (req, res) => { res.json({ user: await getUser(req.params.id) }); });
+app.get('/api/users/:id', requireAuth, async (req, res) => { 
+  res.json({ user: await getUser(req.params.id) }); 
+});
 
 app.put('/api/users/me', requireAuth, async (req, res) => {
   const { first_name, last_name, bio } = req.body;
@@ -173,11 +188,13 @@ app.post('/api/users/me/avatar', requireAuth, upload.single('avatar'), async (re
     const url = await uploadToCloudinary(req.file.buffer, 'gsocial/avatars');
     await pool.query('UPDATE users SET avatar_url=$1 WHERE id=$2', [url, req.session.userId]);
     res.json({ avatar_url: url });
-  } catch (e) { res.status(500).json({ error: 'Upload failed' }); }
+  } catch (e) { 
+    res.status(500).json({ error: 'Upload failed' }); 
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  POSTS, LIKES, COMMENTS, MESSAGES (Kept Exactly the Same)
+//  POSTS, LIKES, COMMENTS, MESSAGES
 // ══════════════════════════════════════════════════════════════════════════════
 app.get('/api/posts', requireAuth, async (req, res) => {
   try {
@@ -191,7 +208,10 @@ app.get('/api/posts', requireAuth, async (req, res) => {
       GROUP BY p.id, u.id ORDER BY p.created_at DESC LIMIT 50
     `, [req.session.userId]);
     res.json({ posts: rows });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { 
+    console.error(e);
+    res.status(500).json({ error: 'Server error' }); 
+  }
 });
 
 app.post('/api/posts', requireAuth, upload.array('images', 9), async (req, res) => {
@@ -207,18 +227,31 @@ app.post('/api/posts', requireAuth, upload.array('images', 9), async (req, res) 
       for (let i = 0; i < urls.length; i++) await client.query('INSERT INTO post_images (post_id,url,sort) VALUES ($1,$2,$3)', [postId, urls[i], i]);
     }
     await client.query('COMMIT');
-    res.json({ post: { id: postId } }); // Simplified return for brevity
-  } catch (e) { await client.query('ROLLBACK'); res.status(500).json({ error: 'Server error' }); } finally { client.release(); }
+    res.json({ post: { id: postId } }); 
+  } catch (e) { 
+    await client.query('ROLLBACK'); 
+    res.status(500).json({ error: 'Server error' }); 
+  } finally { 
+    client.release(); 
+  }
 });
 
 app.post('/api/posts/:id/like', requireAuth, async (req, res) => {
-  try { await pool.query('INSERT INTO likes (post_id,user_id) VALUES ($1,$2)', [req.params.id, req.session.userId]); res.json({ liked: true });
-  } catch { res.status(400).json({ error: 'Already liked' }); }
+  try { 
+    await pool.query('INSERT INTO likes (post_id,user_id) VALUES ($1,$2)', [req.params.id, req.session.userId]); 
+    res.json({ liked: true });
+  } catch { 
+    res.status(400).json({ error: 'Already liked' }); 
+  }
 });
 
 app.post('/api/posts/:id/comments', requireAuth, async (req, res) => {
-  const r = await pool.query('INSERT INTO comments (post_id,user_id,content) VALUES ($1,$2,$3) RETURNING id', [req.params.id, req.session.userId, req.body.content]);
-  res.json({ comment: r.rows[0] });
+  try {
+    const r = await pool.query('INSERT INTO comments (post_id,user_id,content) VALUES ($1,$2,$3) RETURNING id', [req.params.id, req.session.userId, req.body.content]);
+    res.json({ comment: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 app.get('/api/messages/:userId', requireAuth, async (req, res) => {
@@ -228,16 +261,22 @@ app.get('/api/messages/:userId', requireAuth, async (req, res) => {
       WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1) ORDER BY created_at ASC
     `, [req.session.userId, req.params.userId]);
     res.json({ messages: rows });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { 
+    res.status(500).json({ error: 'Server error' }); 
+  }
 });
 
 app.post('/api/messages/:userId', requireAuth, async (req, res) => {
   try {
     const r = await pool.query('INSERT INTO messages (sender_id,receiver_id,content) VALUES ($1,$2,$3) RETURNING id', [req.session.userId, req.params.userId, req.body.content]);
     res.json({ message: r.rows[0] });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { 
+    res.status(500).json({ error: 'Server error' }); 
+  }
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-initDB().then(() => { app.listen(PORT, () => console.log('🚀 API on port ' + PORT)); });
+initDB().then(() => { 
+  app.listen(PORT, () => console.log('🚀 API on port ' + PORT)); 
+});
