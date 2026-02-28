@@ -36,17 +36,18 @@ const upload = multer({
   },
 });
 
-// ── CORS — allow Netlify frontend ──────────────────────────────────────────
-// Add FRONTEND_URL to Render env vars e.g. https://your-site.netlify.app
-const allowedOrigins = [
-  process.env.FRONTEND_URL,
-  'http://localhost:3000',
-  'http://127.0.0.1:5500',
-].filter(Boolean);
-
+// ── CORS ───────────────────────────────────────────────────────────────────
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    // Allow requests with no origin (Postman, curl, mobile apps)
+    if (!origin) return cb(null, true);
+    // Allow localhost for local dev
+    if (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) return cb(null, true);
+    // Allow any netlify.app subdomain
+    if (origin.endsWith('.netlify.app')) return cb(null, true);
+    // Allow specific FRONTEND_URL if set
+    if (process.env.FRONTEND_URL && origin === process.env.FRONTEND_URL) return cb(null, true);
+    // Block everything else
     cb(new Error('CORS blocked: ' + origin));
   },
   credentials: true,
