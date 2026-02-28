@@ -39,7 +39,6 @@ async function initDB() {
     `);
 
     // ── Friendships ───────────────────────────────────────────────────────────
-    // user_id1 < user_id2 always (enforced in queries with least/greatest)
     await client.query(`
       CREATE TABLE IF NOT EXISTS friendships (
         id        SERIAL PRIMARY KEY,
@@ -65,14 +64,49 @@ async function initDB() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_friend_req_recv ON friend_requests(receiver_id, status);`);
 
+    // ── Groups ────────────────────────────────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS groups (
+        id          SERIAL PRIMARY KEY,
+        name        VARCHAR(128) NOT NULL,
+        description TEXT,
+        privacy     VARCHAR(16)  NOT NULL DEFAULT 'public' CHECK (privacy IN ('public','private')),
+        emoji       VARCHAR(8)   NOT NULL DEFAULT '👥',
+        creator_id  INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    // ── Group Members ─────────────────────────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS group_members (
+        id         SERIAL PRIMARY KEY,
+        group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role       VARCHAR(16) NOT NULL DEFAULT 'member' CHECK (role IN ('admin','member')),
+        joined_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(group_id, user_id)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_group_members_user  ON group_members(user_id);`);
+
     // ── Posts ─────────────────────────────────────────────────────────────────
+    // Add group_id column to posts if not already there (safe migration)
     await client.query(`
       CREATE TABLE IF NOT EXISTS posts (
         id         SERIAL PRIMARY KEY,
         user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         content    TEXT    NOT NULL DEFAULT '',
+        group_id   INTEGER REFERENCES groups(id) ON DELETE CASCADE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+    // Safe migration: add group_id if the table already existed without it
+    await client.query(`
+      DO $$ BEGIN
+        ALTER TABLE posts ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE;
+      EXCEPTION WHEN duplicate_column THEN NULL; END $$;
     `);
 
     // ── Post images ───────────────────────────────────────────────────────────
@@ -120,6 +154,7 @@ async function initDB() {
 
     // ── Indexes for performance ───────────────────────────────────────────────
     await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_user       ON posts(user_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_group      ON posts(group_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_created    ON posts(created_at DESC);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_likes_post       ON likes(post_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_comments_post    ON comments(post_id);`);
