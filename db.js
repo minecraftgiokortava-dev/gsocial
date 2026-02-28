@@ -10,20 +10,20 @@ async function initDB() {
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        first_name VARCHAR(50) NOT NULL,
-        last_name  VARCHAR(50) NOT NULL,
+        id         SERIAL PRIMARY KEY,
+        first_name VARCHAR(50)  NOT NULL,
+        last_name  VARCHAR(50)  NOT NULL,
         email      VARCHAR(255) UNIQUE NOT NULL,
         password   VARCHAR(255) NOT NULL,
-        bio        TEXT DEFAULT '',
+        bio        TEXT         DEFAULT '',
         avatar_url VARCHAR(500) DEFAULT '',
-        created_at TIMESTAMP DEFAULT NOW()
+        created_at TIMESTAMP    DEFAULT NOW()
       );
 
       CREATE TABLE IF NOT EXISTS posts (
         id         SERIAL PRIMARY KEY,
         user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        content    TEXT DEFAULT '',
+        content    TEXT      DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
       );
 
@@ -31,7 +31,7 @@ async function initDB() {
         id      SERIAL PRIMARY KEY,
         post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
         url     VARCHAR(500) NOT NULL,
-        sort    INTEGER DEFAULT 0
+        sort    INTEGER      DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS likes (
@@ -45,9 +45,21 @@ async function initDB() {
         id         SERIAL PRIMARY KEY,
         post_id    INTEGER REFERENCES posts(id) ON DELETE CASCADE,
         user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        content    TEXT NOT NULL,
+        content    TEXT      NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS messages (
+        id          SERIAL PRIMARY KEY,
+        sender_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        receiver_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        content     TEXT      NOT NULL,
+        read        BOOLEAN   DEFAULT FALSE,
+        created_at  TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS messages_sender_idx   ON messages(sender_id);
+      CREATE INDEX IF NOT EXISTS messages_receiver_idx ON messages(receiver_id);
 
       CREATE TABLE IF NOT EXISTS "session" (
         "sid"    VARCHAR NOT NULL COLLATE "default",
