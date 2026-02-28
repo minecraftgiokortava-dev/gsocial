@@ -58,13 +58,17 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ── SESSION FIX: increased maxAge + rolling sessions ─────────────────────────
+// Rolling: true means every request resets the cookie expiry — so users who
+// are actively using the site never get logged out.
 app.use(session({
   store: new pgSession({ pool, tableName: 'session', createTableIfMissing: false }),
   secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
   resave: false,
   saveUninitialized: false,
+  rolling: true, // ← KEY FIX: resets maxAge on every request, keeps active users logged in
   cookie: {
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days (was 7) — longer expiry
     secure: process.env.NODE_ENV === 'production',
     httpOnly: true,
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
@@ -288,7 +292,6 @@ app.post('/api/friends/requests/:id', requireAuth, async (req, res) => {
       [receiverId, req.session.userId]
     );
     if (reverse.rowCount) {
-      // Auto-accept: create friendship, mark both as accepted
       await pool.query(
         `INSERT INTO friendships (user_id1, user_id2)
          VALUES (least($1::int,$2::int), greatest($1::int,$2::int))
@@ -411,7 +414,6 @@ app.post('/api/posts', requireAuth, upload.array('images', 9), async (req, res) 
       }
     }
     await client.query('COMMIT');
-    // Return the full post with user info
     const { rows } = await pool.query(`
       SELECT p.id, p.content, p.created_at, u.id AS user_id, u.first_name, u.last_name, u.avatar_url,
         0::int AS likes_count, 0::int AS comments_count, false AS liked_by_me,
@@ -532,7 +534,6 @@ app.delete('/api/posts/:postId/comments/:commentId', requireAuth, async (req, re
 //  MESSAGES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/messages/conversations — list of people the current user has chatted with
 app.get('/api/messages/conversations', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -554,7 +555,6 @@ app.get('/api/messages/conversations', requireAuth, async (req, res) => {
       JOIN users u ON u.id = sub.other_user
       ORDER BY other_user, m.created_at DESC
     `, [req.session.userId]);
-    // Sort by last_ts descending
     rows.sort((a, b) => new Date(b.last_ts) - new Date(a.last_ts));
     res.json({ conversations: rows });
   } catch (e) {
@@ -597,6 +597,172 @@ app.post('/api/messages/:userId', requireAuth, async (req, res) => {
       }
     });
   } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  GROUPS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/groups — list all groups with membership status
+app.get('/api/groups', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT g.id, g.name, g.description, g.privacy, g.emoji, g.created_at,
+        g.creator_id,
+        COUNT(DISTINCT gm.user_id)::int AS member_count,
+        BOOL_OR(gm.user_id = $1) AS is_member
+      FROM groups g
+      LEFT JOIN group_members gm ON gm.group_id = g.id
+      GROUP BY g.id
+      ORDER BY g.created_at DESC
+    `, [req.session.userId]);
+    res.json({ groups: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/groups/:id — single group detail
+app.get('/api/groups/:id', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT g.id, g.name, g.description, g.privacy, g.emoji, g.created_at,
+        g.creator_id,
+        COUNT(DISTINCT gm.user_id)::int AS member_count,
+        BOOL_OR(gm.user_id = $1) AS is_member
+      FROM groups g
+      LEFT JOIN group_members gm ON gm.group_id = g.id
+      WHERE g.id = $2
+      GROUP BY g.id
+    `, [req.session.userId, req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Group not found' });
+    res.json({ group: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/groups — create a group
+app.post('/api/groups', requireAuth, async (req, res) => {
+  const { name, description, privacy, emoji } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Group name required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query(
+      `INSERT INTO groups (name, description, privacy, emoji, creator_id)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [name.trim(), description?.trim() || null, privacy || 'public', emoji || '👥', req.session.userId]
+    );
+    const groupId = r.rows[0].id;
+    // Creator auto-joins as admin
+    await client.query(
+      `INSERT INTO group_members (group_id, user_id, role) VALUES ($1,$2,'admin')`,
+      [groupId, req.session.userId]
+    );
+    await client.query('COMMIT');
+    const { rows } = await pool.query(`
+      SELECT g.*, COUNT(gm.user_id)::int AS member_count, true AS is_member
+      FROM groups g LEFT JOIN group_members gm ON gm.group_id=g.id
+      WHERE g.id=$1 GROUP BY g.id
+    `, [groupId]);
+    res.json({ group: rows[0] });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/groups/:id/join — join a group
+app.post('/api/groups/:id/join', requireAuth, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO group_members (group_id, user_id, role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`,
+      [req.params.id, req.session.userId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/groups/:id/join — leave a group
+app.delete('/api/groups/:id/join', requireAuth, async (req, res) => {
+  try {
+    await pool.query(
+      `DELETE FROM group_members WHERE group_id=$1 AND user_id=$2`,
+      [req.params.id, req.session.userId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/groups/:id/members — list members
+app.get('/api/groups/:id/members', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT u.id, u.first_name, u.last_name, u.avatar_url, gm.role, gm.joined_at
+      FROM group_members gm
+      JOIN users u ON u.id = gm.user_id
+      WHERE gm.group_id = $1
+      ORDER BY gm.role='admin' DESC, gm.joined_at ASC
+    `, [req.params.id]);
+    res.json({ members: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/groups/:id/posts — get posts in a group
+app.get('/api/groups/:id/posts', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT p.id, p.content, p.created_at, u.id AS user_id, u.first_name, u.last_name, u.avatar_url,
+        COUNT(DISTINCT l.id)::int AS likes_count,
+        COUNT(DISTINCT c.id)::int AS comments_count,
+        BOOL_OR(l.user_id = $1) AS liked_by_me
+      FROM posts p
+      JOIN users u ON u.id = p.user_id
+      LEFT JOIN likes l ON l.post_id = p.id
+      LEFT JOIN comments c ON c.post_id = p.id
+      WHERE p.group_id = $2
+      GROUP BY p.id, u.id
+      ORDER BY p.created_at DESC
+      LIMIT 50
+    `, [req.session.userId, req.params.id]);
+    res.json({ posts: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/groups/:id/posts — post in a group (must be member)
+app.post('/api/groups/:id/posts', requireAuth, async (req, res) => {
+  const { content } = req.body;
+  if (!content?.trim()) return res.status(400).json({ error: 'Post cannot be empty' });
+  try {
+    // Check membership
+    const mem = await pool.query(
+      `SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2`,
+      [req.params.id, req.session.userId]
+    );
+    if (!mem.rowCount) return res.status(403).json({ error: 'You must join the group to post' });
+    const r = await pool.query(
+      `INSERT INTO posts (user_id, content, group_id) VALUES ($1,$2,$3) RETURNING id`,
+      [req.session.userId, content.trim(), req.params.id]
+    );
+    res.json({ ok: true, post_id: r.rows[0].id });
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Server error' });
   }
 });
