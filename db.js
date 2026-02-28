@@ -61,6 +61,15 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS messages_sender_idx   ON messages(sender_id);
       CREATE INDEX IF NOT EXISTS messages_receiver_idx ON messages(receiver_id);
 
+      -- NEW: Friendships Table
+      CREATE TABLE IF NOT EXISTS friendships (
+        id         SERIAL PRIMARY KEY,
+        user_id1   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        user_id2   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(least(user_id1, user_id2), greatest(user_id1, user_id2))
+      );
+
       CREATE TABLE IF NOT EXISTS "session" (
         "sid"    VARCHAR NOT NULL COLLATE "default",
         "sess"   JSON    NOT NULL,
