@@ -64,8 +64,8 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    maxAge: 7 * 24 * 60 * 60 * 1000, 
-    secure: process.env.NODE_ENV === 'production',    
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    secure: process.env.NODE_ENV === 'production',
     httpOnly: true,
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
   },
@@ -88,8 +88,10 @@ async function getUser(id) {
 // ══════════════════════════════════════════════════════════════════════════════
 app.post('/api/auth/signup', async (req, res) => {
   const { first_name, last_name, email, password } = req.body;
-  if (!first_name || !last_name || !email || !password) return res.status(400).json({ error: 'All fields required' });
-  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (!first_name || !last_name || !email || !password)
+    return res.status(400).json({ error: 'All fields required' });
+  if (password.length < 6)
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
   try {
     const hash = await bcrypt.hash(password, 12);
     const r = await pool.query(
@@ -106,79 +108,63 @@ app.post('/api/auth/signup', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   try {
     const r = await pool.query('SELECT * FROM users WHERE email=$1', [email.toLowerCase().trim()]);
     const user = r.rows[0];
-    if (!user || !(await bcrypt.compare(password, user.password))) return res.status(400).json({ error: 'Invalid email/password' });
+    if (!user || !(await bcrypt.compare(password, user.password)))
+      return res.status(400).json({ error: 'Invalid email/password' });
     req.session.userId = user.id;
     req.session.save(async () => res.json({ user: await getUser(user.id) }));
-  } catch (e) { 
-    res.status(500).json({ error: 'Server error' }); 
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.post('/api/auth/logout', (req, res) => { 
-  req.session.destroy(() => res.json({ ok: true })); 
+app.post('/api/auth/logout', (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
 });
 
-app.get('/api/auth/me', requireAuth, async (req, res) => { 
-  res.json({ user: await getUser(req.session.userId) }); 
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  res.json({ user: await getUser(req.session.userId) });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  USERS & FRIENDS 
+//  USERS
 // ══════════════════════════════════════════════════════════════════════════════
 app.get('/api/users/search', requireAuth, async (req, res) => {
   const { q } = req.query;
   if (!q) return res.json({ users: [] });
   try {
     const { rows } = await pool.query(
-      `SELECT id, first_name, last_name, avatar_url FROM users 
+      `SELECT id, first_name, last_name, avatar_url FROM users
        WHERE (first_name || ' ' || last_name) ILIKE $1 AND id != $2 LIMIT 10`,
       [`%${q}%`, req.session.userId]
     );
     res.json({ users: rows });
-  } catch (e) { 
-    res.status(500).json({ error: 'Server error' }); 
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-app.post('/api/friends/:id', requireAuth, async (req, res) => {
-  const friendId = parseInt(req.params.id);
-  if (friendId === req.session.userId) return res.status(400).json({ error: "Can't add yourself" });
-  try {
-    await pool.query(
-      `INSERT INTO friendships (user_id1, user_id2) VALUES (least($1::int, $2::int), greatest($1::int, $2::int)) ON CONFLICT DO NOTHING`,
-      [req.session.userId, friendId]
-    );
-    res.json({ ok: true });
-  } catch (e) { 
-    res.status(500).json({ error: 'Server error' }); 
-  }
+// NOTE: This route must come BEFORE /api/users/:id
+app.get('/api/users/me', requireAuth, async (req, res) => {
+  res.json({ user: await getUser(req.session.userId) });
 });
 
-app.get('/api/friends', requireAuth, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT u.id, u.first_name, u.last_name, u.avatar_url 
-       FROM friendships f 
-       JOIN users u ON u.id = CASE WHEN f.user_id1 = $1 THEN f.user_id2 ELSE f.user_id1 END
-       WHERE f.user_id1 = $1 OR f.user_id2 = $1`,
-      [req.session.userId]
-    );
-    res.json({ friends: rows });
-  } catch (e) { 
-    res.status(500).json({ error: 'Server error' }); 
-  }
-});
-
-app.get('/api/users/:id', requireAuth, async (req, res) => { 
-  res.json({ user: await getUser(req.params.id) }); 
+app.get('/api/users/:id', requireAuth, async (req, res) => {
+  const user = await getUser(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json({ user });
 });
 
 app.put('/api/users/me', requireAuth, async (req, res) => {
   const { first_name, last_name, bio } = req.body;
-  await pool.query('UPDATE users SET first_name=$1, last_name=$2, bio=$3 WHERE id=$4', [first_name, last_name, bio, req.session.userId]);
+  if (!first_name || !last_name) return res.status(400).json({ error: 'Name fields required' });
+  await pool.query(
+    'UPDATE users SET first_name=$1, last_name=$2, bio=$3 WHERE id=$4',
+    [first_name.trim(), last_name.trim(), bio || null, req.session.userId]
+  );
   res.json({ user: await getUser(req.session.userId) });
 });
 
@@ -188,68 +174,285 @@ app.post('/api/users/me/avatar', requireAuth, upload.single('avatar'), async (re
     const url = await uploadToCloudinary(req.file.buffer, 'gsocial/avatars');
     await pool.query('UPDATE users SET avatar_url=$1 WHERE id=$2', [url, req.session.userId]);
     res.json({ avatar_url: url });
-  } catch (e) { 
-    res.status(500).json({ error: 'Upload failed' }); 
+  } catch (e) {
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+// Per-user posts (for profile page)
+app.get('/api/users/:id/posts', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT p.id, p.content, p.created_at, u.id AS user_id, u.first_name, u.last_name, u.avatar_url,
+        COUNT(DISTINCT l.id)::int AS likes_count,
+        COUNT(DISTINCT c.id)::int AS comments_count,
+        BOOL_OR(l.user_id = $1) AS liked_by_me,
+        json_agg(DISTINCT jsonb_build_object('url', pi.url, 'sort', pi.sort))
+          FILTER (WHERE pi.id IS NOT NULL) AS images
+      FROM posts p
+      JOIN users u ON u.id = p.user_id
+      LEFT JOIN likes l ON l.post_id = p.id
+      LEFT JOIN comments c ON c.post_id = p.id
+      LEFT JOIN post_images pi ON pi.post_id = p.id
+      WHERE p.user_id = $2
+      GROUP BY p.id, u.id
+      ORDER BY p.created_at DESC
+      LIMIT 50
+    `, [req.session.userId, req.params.id]);
+    res.json({ posts: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  POSTS, LIKES, COMMENTS, MESSAGES
+//  FRIENDS
+// ══════════════════════════════════════════════════════════════════════════════
+app.post('/api/friends/:id', requireAuth, async (req, res) => {
+  const friendId = parseInt(req.params.id);
+  if (friendId === req.session.userId)
+    return res.status(400).json({ error: "Can't add yourself" });
+  try {
+    await pool.query(
+      `INSERT INTO friendships (user_id1, user_id2)
+       VALUES (least($1::int, $2::int), greatest($1::int, $2::int))
+       ON CONFLICT DO NOTHING`,
+      [req.session.userId, friendId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/friends/:id', requireAuth, async (req, res) => {
+  const friendId = parseInt(req.params.id);
+  try {
+    await pool.query(
+      `DELETE FROM friendships
+       WHERE user_id1 = least($1::int,$2::int) AND user_id2 = greatest($1::int,$2::int)`,
+      [req.session.userId, friendId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/friends', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.first_name, u.last_name, u.avatar_url
+       FROM friendships f
+       JOIN users u ON u.id = CASE WHEN f.user_id1=$1 THEN f.user_id2 ELSE f.user_id1 END
+       WHERE f.user_id1=$1 OR f.user_id2=$1`,
+      [req.session.userId]
+    );
+    res.json({ friends: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  POSTS
 // ══════════════════════════════════════════════════════════════════════════════
 app.get('/api/posts', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT p.id, p.content, p.created_at, u.id AS user_id, u.first_name, u.last_name, u.avatar_url,
-        COUNT(DISTINCT l.id)::int AS likes_count, COUNT(DISTINCT c.id)::int AS comments_count,
+        COUNT(DISTINCT l.id)::int AS likes_count,
+        COUNT(DISTINCT c.id)::int AS comments_count,
         BOOL_OR(l.user_id = $1) AS liked_by_me,
-        json_agg(DISTINCT jsonb_build_object('url', pi.url, 'sort', pi.sort)) FILTER (WHERE pi.id IS NOT NULL) AS images
-      FROM posts p JOIN users u ON u.id = p.user_id
-      LEFT JOIN likes l ON l.post_id = p.id LEFT JOIN comments c ON c.post_id = p.id LEFT JOIN post_images pi ON pi.post_id = p.id
-      GROUP BY p.id, u.id ORDER BY p.created_at DESC LIMIT 50
+        json_agg(DISTINCT jsonb_build_object('url', pi.url, 'sort', pi.sort))
+          FILTER (WHERE pi.id IS NOT NULL) AS images
+      FROM posts p
+      JOIN users u ON u.id = p.user_id
+      LEFT JOIN likes l ON l.post_id = p.id
+      LEFT JOIN comments c ON c.post_id = p.id
+      LEFT JOIN post_images pi ON pi.post_id = p.id
+      GROUP BY p.id, u.id
+      ORDER BY p.created_at DESC
+      LIMIT 50
     `, [req.session.userId]);
     res.json({ posts: rows });
-  } catch (e) { 
+  } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Server error' }); 
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 app.post('/api/posts', requireAuth, upload.array('images', 9), async (req, res) => {
   const { content } = req.body;
-  if (!content?.trim() && !req.files?.length) return res.status(400).json({ error: 'Post cannot be empty' });
+  if (!content?.trim() && !req.files?.length)
+    return res.status(400).json({ error: 'Post cannot be empty' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const r = await client.query('INSERT INTO posts (user_id,content) VALUES ($1,$2) RETURNING id', [req.session.userId, content?.trim() || '']);
+    const r = await client.query(
+      'INSERT INTO posts (user_id,content) VALUES ($1,$2) RETURNING id',
+      [req.session.userId, content?.trim() || '']
+    );
     const postId = r.rows[0].id;
     if (req.files?.length) {
       const urls = await Promise.all(req.files.map(f => uploadToCloudinary(f.buffer, 'gsocial/posts')));
-      for (let i = 0; i < urls.length; i++) await client.query('INSERT INTO post_images (post_id,url,sort) VALUES ($1,$2,$3)', [postId, urls[i], i]);
+      for (let i = 0; i < urls.length; i++) {
+        await client.query(
+          'INSERT INTO post_images (post_id,url,sort) VALUES ($1,$2,$3)',
+          [postId, urls[i], i]
+        );
+      }
     }
     await client.query('COMMIT');
-    res.json({ post: { id: postId } }); 
-  } catch (e) { 
-    await client.query('ROLLBACK'); 
-    res.status(500).json({ error: 'Server error' }); 
-  } finally { 
-    client.release(); 
+    // Return the full post with user info
+    const { rows } = await pool.query(`
+      SELECT p.id, p.content, p.created_at, u.id AS user_id, u.first_name, u.last_name, u.avatar_url,
+        0::int AS likes_count, 0::int AS comments_count, false AS liked_by_me,
+        json_agg(DISTINCT jsonb_build_object('url', pi.url, 'sort', pi.sort))
+          FILTER (WHERE pi.id IS NOT NULL) AS images
+      FROM posts p
+      JOIN users u ON u.id = p.user_id
+      LEFT JOIN post_images pi ON pi.post_id = p.id
+      WHERE p.id = $1
+      GROUP BY p.id, u.id
+    `, [postId]);
+    res.json({ post: rows[0] });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 
+app.delete('/api/posts/:id', requireAuth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'DELETE FROM posts WHERE id=$1 AND user_id=$2 RETURNING id',
+      [req.params.id, req.session.userId]
+    );
+    if (!r.rowCount) return res.status(403).json({ error: 'Not authorized or post not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── LIKES ────────────────────────────────────────────────────────────────────
 app.post('/api/posts/:id/like', requireAuth, async (req, res) => {
-  try { 
-    await pool.query('INSERT INTO likes (post_id,user_id) VALUES ($1,$2)', [req.params.id, req.session.userId]); 
-    res.json({ liked: true });
-  } catch { 
-    res.status(400).json({ error: 'Already liked' }); 
+  try {
+    await pool.query(
+      'INSERT INTO likes (post_id,user_id) VALUES ($1,$2)',
+      [req.params.id, req.session.userId]
+    );
+    const r = await pool.query('SELECT COUNT(*)::int AS count FROM likes WHERE post_id=$1', [req.params.id]);
+    res.json({ liked: true, count: r.rows[0].count });
+  } catch {
+    res.status(400).json({ error: 'Already liked' });
+  }
+});
+
+app.delete('/api/posts/:id/like', requireAuth, async (req, res) => {
+  try {
+    await pool.query(
+      'DELETE FROM likes WHERE post_id=$1 AND user_id=$2',
+      [req.params.id, req.session.userId]
+    );
+    const r = await pool.query('SELECT COUNT(*)::int AS count FROM likes WHERE post_id=$1', [req.params.id]);
+    res.json({ liked: false, count: r.rows[0].count });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── COMMENTS ─────────────────────────────────────────────────────────────────
+app.get('/api/posts/:id/comments', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT c.id, c.content, c.created_at, c.user_id,
+        u.first_name, u.last_name, u.avatar_url
+      FROM comments c
+      JOIN users u ON u.id = c.user_id
+      WHERE c.post_id = $1
+      ORDER BY c.created_at ASC
+    `, [req.params.id]);
+    res.json({ comments: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 app.post('/api/posts/:id/comments', requireAuth, async (req, res) => {
+  const { content } = req.body;
+  if (!content?.trim()) return res.status(400).json({ error: 'Comment cannot be empty' });
   try {
-    const r = await pool.query('INSERT INTO comments (post_id,user_id,content) VALUES ($1,$2,$3) RETURNING id', [req.params.id, req.session.userId, req.body.content]);
-    res.json({ comment: r.rows[0] });
+    const r = await pool.query(
+      'INSERT INTO comments (post_id,user_id,content) VALUES ($1,$2,$3) RETURNING id, created_at',
+      [req.params.id, req.session.userId, content.trim()]
+    );
+    const user = await getUser(req.session.userId);
+    res.json({
+      comment: {
+        id: r.rows[0].id,
+        content: content.trim(),
+        created_at: r.rows[0].created_at,
+        user_id: user.id,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        avatar_url: user.avatar_url,
+      }
+    });
   } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/posts/:postId/comments/:commentId', requireAuth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'DELETE FROM comments WHERE id=$1 AND user_id=$2 RETURNING id',
+      [req.params.commentId, req.session.userId]
+    );
+    if (!r.rowCount) return res.status(403).json({ error: 'Not authorized or comment not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  MESSAGES
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/messages/conversations — list of people the current user has chatted with
+app.get('/api/messages/conversations', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT DISTINCT ON (other_user)
+        other_user AS user_id,
+        u.first_name,
+        u.last_name,
+        u.avatar_url,
+        m.content AS last_message,
+        m.created_at AS last_ts
+      FROM (
+        SELECT
+          CASE WHEN sender_id = $1 THEN receiver_id ELSE sender_id END AS other_user,
+          id
+        FROM messages
+        WHERE sender_id = $1 OR receiver_id = $1
+      ) sub
+      JOIN messages m ON m.id = sub.id
+      JOIN users u ON u.id = sub.other_user
+      ORDER BY other_user, m.created_at DESC
+    `, [req.session.userId]);
+    // Sort by last_ts descending
+    rows.sort((a, b) => new Date(b.last_ts) - new Date(a.last_ts));
+    res.json({ conversations: rows });
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -257,26 +460,44 @@ app.post('/api/posts/:id/comments', requireAuth, async (req, res) => {
 app.get('/api/messages/:userId', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT id, content, created_at, sender_id, receiver_id, (sender_id=$1) AS from_me FROM messages
-      WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1) ORDER BY created_at ASC
+      SELECT id, content, created_at, sender_id, receiver_id,
+        (sender_id = $1) AS from_me
+      FROM messages
+      WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1)
+      ORDER BY created_at ASC
     `, [req.session.userId, req.params.userId]);
     res.json({ messages: rows });
-  } catch (e) { 
-    res.status(500).json({ error: 'Server error' }); 
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 app.post('/api/messages/:userId', requireAuth, async (req, res) => {
+  const { content } = req.body;
+  if (!content?.trim()) return res.status(400).json({ error: 'Message cannot be empty' });
   try {
-    const r = await pool.query('INSERT INTO messages (sender_id,receiver_id,content) VALUES ($1,$2,$3) RETURNING id', [req.session.userId, req.params.userId, req.body.content]);
-    res.json({ message: r.rows[0] });
-  } catch (e) { 
-    res.status(500).json({ error: 'Server error' }); 
+    const r = await pool.query(
+      'INSERT INTO messages (sender_id,receiver_id,content) VALUES ($1,$2,$3) RETURNING id, created_at',
+      [req.session.userId, req.params.userId, content.trim()]
+    );
+    res.json({
+      message: {
+        id: r.rows[0].id,
+        content: content.trim(),
+        created_at: r.rows[0].created_at,
+        sender_id: req.session.userId,
+        receiver_id: parseInt(req.params.userId),
+        from_me: true,
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
+// ── Health ────────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-initDB().then(() => { 
-  app.listen(PORT, () => console.log('🚀 API on port ' + PORT)); 
+initDB().then(() => {
+  app.listen(PORT, () => console.log('🚀 API on port ' + PORT));
 });
