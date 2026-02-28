@@ -334,3 +334,22 @@ initDB().then(() => {
   console.error('Failed to init DB:', err);
   process.exit(1);
 });
+
+// ── Self-ping every 10 minutes to keep Render free tier alive ─────────────
+// Render uses HTTPS, so we ping our own /api/health endpoint
+const https = require('https');
+
+function selfPing() {
+  const url = process.env.RENDER_EXTERNAL_URL || `https://gsocial-8axe.onrender.com`;
+  https.get(`${url}/api/health`, (res) => {
+    console.log(`🏓 Self-ping OK — ${new Date().toISOString()} (status ${res.statusCode})`);
+  }).on('error', (err) => {
+    console.warn(`⚠️  Self-ping failed: ${err.message}`);
+  });
+}
+
+// Only ping in production so it doesn't run during local dev
+if (process.env.NODE_ENV === 'production') {
+  setInterval(selfPing, 10 * 60 * 1000); // every 10 minutes
+  setTimeout(selfPing, 5000); // first ping 5s after boot
+}
