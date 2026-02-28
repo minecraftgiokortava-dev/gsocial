@@ -11,7 +11,7 @@ async function initDB() {
   try {
     await client.query('BEGIN');
 
-    // ── Session store ─────────────────────────────────────────────────────────
+    // ── Session store (connect-pg-simple) ─────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS "session" (
         "sid"    varchar   NOT NULL COLLATE "default",
@@ -20,23 +20,26 @@ async function initDB() {
         CONSTRAINT "session_pkey" PRIMARY KEY ("sid")
       );
     `);
-    await client.query(`CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");`);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");
+    `);
 
     // ── Users ─────────────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
-        id         SERIAL PRIMARY KEY,
-        first_name VARCHAR(64)  NOT NULL,
-        last_name  VARCHAR(64)  NOT NULL,
-        email      VARCHAR(255) NOT NULL UNIQUE,
-        password   TEXT         NOT NULL,
-        bio        TEXT,
-        avatar_url TEXT,
-        created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        id          SERIAL PRIMARY KEY,
+        first_name  VARCHAR(64)  NOT NULL,
+        last_name   VARCHAR(64)  NOT NULL,
+        email       VARCHAR(255) NOT NULL UNIQUE,
+        password    TEXT         NOT NULL,
+        bio         TEXT,
+        avatar_url  TEXT,
+        created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
       );
     `);
 
-    // ── Friendships & Requests ────────────────────────────────────────────────
+    // ── Friendships ───────────────────────────────────────────────────────────
+    // user_id1 < user_id2 always (enforced in queries with least/greatest)
     await client.query(`
       CREATE TABLE IF NOT EXISTS friendships (
         id        SERIAL PRIMARY KEY,
@@ -47,52 +50,32 @@ async function initDB() {
         CHECK(user_id1 < user_id2)
       );
     `);
+
+    // ── Friend Requests ───────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS friend_requests (
         id          SERIAL PRIMARY KEY,
         sender_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         receiver_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        status      VARCHAR(16) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','declined')),
+        status      VARCHAR(16) NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','accepted','declined')),
         created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE(sender_id, receiver_id)
       );
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_friend_req_recv ON friend_requests(receiver_id, status);`);
 
-    // ── Groups (NEW) ──────────────────────────────────────────────────────────
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS groups (
-        id          SERIAL PRIMARY KEY,
-        name        VARCHAR(255) NOT NULL,
-        description TEXT,
-        creator_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS group_members (
-        group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        role       VARCHAR(50) DEFAULT 'member',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (group_id, user_id)
-      );
-    `);
-
-    // ── Posts (UPDATED with group_id) ─────────────────────────────────────────
+    // ── Posts ─────────────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS posts (
         id         SERIAL PRIMARY KEY,
         user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        group_id   INTEGER REFERENCES groups(id) ON DELETE CASCADE,
         content    TEXT    NOT NULL DEFAULT '',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
-    // Ensure the column exists if the table was already created before
-    await client.query(`ALTER TABLE posts ADD COLUMN IF NOT EXISTS group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE;`);
 
-    // ── Post images, Likes, Comments, Messages ────────────────────────────────
+    // ── Post images ───────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS post_images (
         id      SERIAL PRIMARY KEY,
@@ -101,6 +84,8 @@ async function initDB() {
         sort    INTEGER NOT NULL DEFAULT 0
       );
     `);
+
+    // ── Likes ─────────────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS likes (
         id         SERIAL PRIMARY KEY,
@@ -110,6 +95,8 @@ async function initDB() {
         UNIQUE(post_id, user_id)
       );
     `);
+
+    // ── Comments ──────────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS comments (
         id         SERIAL PRIMARY KEY,
@@ -119,6 +106,8 @@ async function initDB() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
+
+    // ── Messages ──────────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id          SERIAL PRIMARY KEY,
@@ -129,16 +118,15 @@ async function initDB() {
       );
     `);
 
-    // ── Indexes ───────────────────────────────────────────────────────────────
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_user        ON posts(user_id);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_group       ON posts(group_id);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_created     ON posts(created_at DESC);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_likes_post        ON likes(post_id);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_comments_post     ON comments(post_id);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_messages_sender   ON messages(sender_id);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_messages_recv     ON messages(receiver_id);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_messages_created  ON messages(created_at ASC);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_post_images_post  ON post_images(post_id);`);
+    // ── Indexes for performance ───────────────────────────────────────────────
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_user       ON posts(user_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_created    ON posts(created_at DESC);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_likes_post       ON likes(post_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_comments_post    ON comments(post_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_messages_sender  ON messages(sender_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_messages_recv    ON messages(receiver_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at ASC);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_post_images_post ON post_images(post_id);`);
 
     await client.query('COMMIT');
     console.log('✅ Database initialized');
