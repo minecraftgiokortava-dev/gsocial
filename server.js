@@ -11,6 +11,10 @@ const { pool, initDB } = require('./db');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// ✅ CRITICAL FIX: Trust the reverse proxy (Render). 
+// Without this, Express will not set 'secure' cookies because it thinks the connection is HTTP.
+app.set('trust proxy', 1);
+
 // ── Cloudinary ──────────────────────────────────────────────────────────────
 cloudinary.config({ cloudinary_url: process.env.CLOUDINARY_URL });
 
@@ -35,8 +39,6 @@ const upload = multer({
 });
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
-// ✅ FIX: The old config blocked *.netlify.app AND *.onrender.com origins.
-//    We now allow all of these explicitly.
 const ALLOWED_ORIGINS = [
   // Local dev
   /^https?:\/\/localhost(:\d+)?$/,
@@ -67,10 +69,6 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
-// ✅ FIX: sameSite MUST be 'none' in production.
-//    'lax' silently drops cookies on cross-origin requests — this was causing
-//    every API call after a page refresh to return 401 "Not logged in".
-//    Netlify frontend → Render backend = cross-origin = needs sameSite:'none'
 app.use(session({
   store: new pgSession({ pool, tableName: 'session' }),
   secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
@@ -114,9 +112,6 @@ app.post('/api/auth/signup', async (req, res) => {
       [first_name.trim(), last_name.trim(), email.toLowerCase().trim(), hash]
     );
     const userId = r.rows[0].id;
-    // ✅ FIX: session.save() guarantees the cookie is written BEFORE the
-    //    response is sent. Without this there's a race condition causing 401
-    //    on the very next request after signup.
     req.session.userId = userId;
     req.session.save(async (err) => {
       if (err) { console.error('Session save error:', err); return res.status(500).json({ error: 'Session error' }); }
@@ -137,7 +132,6 @@ app.post('/api/auth/login', async (req, res) => {
     const user = r.rows[0];
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(400).json({ error: 'Invalid email or password' });
-    // ✅ FIX: same session.save() guarantee
     req.session.userId = user.id;
     req.session.save(async (err) => {
       if (err) { console.error('Session save error:', err); return res.status(500).json({ error: 'Session error' }); }
