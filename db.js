@@ -51,6 +51,20 @@ async function initDB() {
       );
     `);
 
+    // ── Friend Requests ───────────────────────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS friend_requests (
+        id          SERIAL PRIMARY KEY,
+        sender_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        receiver_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status      VARCHAR(16) NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','accepted','declined')),
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(sender_id, receiver_id)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_friend_req_recv ON friend_requests(receiver_id, status);`);
+
     // ── Posts ─────────────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS posts (
