@@ -275,11 +275,23 @@ app.delete('/api/announcements/active', requireAdmin, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 app.get('/api/admin/users', requireAdmin, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, first_name, last_name, email, role, avatar_url, created_at,
-        (SELECT COUNT(*)::int FROM posts WHERE user_id=users.id) AS post_count
-       FROM users ORDER BY created_at DESC`
-    );
+    let rows;
+    try {
+      const r = await pool.query(
+        `SELECT id, first_name, last_name, email, role, avatar_url, created_at,
+          (SELECT COUNT(*)::int FROM posts WHERE user_id=users.id) AS post_count
+         FROM users ORDER BY created_at DESC`
+      );
+      rows = r.rows;
+    } catch (qe) {
+      // Fallback without post_count if posts table has issues
+      console.warn('Admin users full query failed, using fallback:', qe.message);
+      const r = await pool.query(
+        `SELECT id, first_name, last_name, email, role, avatar_url, created_at, 0 AS post_count
+         FROM users ORDER BY created_at DESC`
+      );
+      rows = r.rows;
+    }
     res.json({ users: rows });
   } catch (e) { console.error('GET /api/admin/users error:', e); res.status(500).json({ error: e.message }); }
 });
@@ -305,21 +317,43 @@ app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
 
 app.get('/api/admin/posts', requireAdmin, async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT p.id, p.content, p.created_at,
-        u.id AS user_id, u.first_name, u.last_name, u.avatar_url, u.role,
-        COUNT(DISTINCT l.id)::int AS likes_count,
-        COUNT(DISTINCT c.id)::int AS comments_count,
-        json_agg(DISTINCT jsonb_build_object('url', pi.url, 'sort', pi.sort))
-          FILTER (WHERE pi.id IS NOT NULL) AS images
-      FROM posts p
-      JOIN users u ON u.id = p.user_id
-      LEFT JOIN likes l ON l.post_id = p.id
-      LEFT JOIN comments c ON c.post_id = p.id
-      LEFT JOIN post_images pi ON pi.post_id = p.id
-      GROUP BY p.id, u.id
-      ORDER BY p.created_at DESC LIMIT 200
-    `);
+    // Try full query with images first
+    let rows;
+    try {
+      const r = await pool.query(`
+        SELECT p.id, p.content, p.created_at,
+          u.id AS user_id, u.first_name, u.last_name, u.avatar_url, u.role,
+          COUNT(DISTINCT l.id)::int AS likes_count,
+          COUNT(DISTINCT c.id)::int AS comments_count,
+          json_agg(DISTINCT jsonb_build_object('url', pi.url, 'sort', pi.sort))
+            FILTER (WHERE pi.id IS NOT NULL) AS images
+        FROM posts p
+        JOIN users u ON u.id = p.user_id
+        LEFT JOIN likes l ON l.post_id = p.id
+        LEFT JOIN comments c ON c.post_id = p.id
+        LEFT JOIN post_images pi ON pi.post_id = p.id
+        GROUP BY p.id, u.id
+        ORDER BY p.created_at DESC LIMIT 200
+      `);
+      rows = r.rows;
+    } catch (qe) {
+      // Fallback: skip post_images if table doesn't exist yet
+      console.warn('Admin posts full query failed, using fallback:', qe.message);
+      const r = await pool.query(`
+        SELECT p.id, p.content, p.created_at,
+          u.id AS user_id, u.first_name, u.last_name, u.avatar_url, u.role,
+          COUNT(DISTINCT l.id)::int AS likes_count,
+          COUNT(DISTINCT c.id)::int AS comments_count,
+          '[]'::json AS images
+        FROM posts p
+        JOIN users u ON u.id = p.user_id
+        LEFT JOIN likes l ON l.post_id = p.id
+        LEFT JOIN comments c ON c.post_id = p.id
+        GROUP BY p.id, u.id
+        ORDER BY p.created_at DESC LIMIT 200
+      `);
+      rows = r.rows;
+    }
     res.json({ posts: rows });
   } catch (e) { console.error('GET /api/admin/posts error:', e); res.status(500).json({ error: e.message }); }
 });
