@@ -11,7 +11,7 @@ async function initDB() {
   try {
     await client.query('BEGIN');
 
-    // ── Session store (connect-pg-simple) ─────────────────────────────────────
+    // ── Session store ─────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS "session" (
         "sid"    varchar   NOT NULL COLLATE "default",
@@ -20,11 +20,9 @@ async function initDB() {
         CONSTRAINT "session_pkey" PRIMARY KEY ("sid")
       );
     `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");
-    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");`);
 
-    // ── Users ─────────────────────────────────────────────────────────────────
+    // ── Users (with role column) ──────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id          SERIAL PRIMARY KEY,
@@ -34,16 +32,30 @@ async function initDB() {
         password    TEXT         NOT NULL,
         bio         TEXT,
         avatar_url  TEXT,
+        role        VARCHAR(16)  NOT NULL DEFAULT 'user',
         created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+      );
+    `);
+    // Safe migration: add role if table already existed without it
+    await client.query(`DO $$ BEGIN ALTER TABLE users ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'user'; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`);
+
+    // ── Announcements ─────────────────────────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS announcements (
+        id         SERIAL PRIMARY KEY,
+        content    TEXT        NOT NULL,
+        active     BOOLEAN     NOT NULL DEFAULT TRUE,
+        created_by INTEGER     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
 
     // ── Friendships ───────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS friendships (
-        id        SERIAL PRIMARY KEY,
-        user_id1  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        user_id2  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        id         SERIAL PRIMARY KEY,
+        user_id1   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        user_id2   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE(user_id1, user_id2),
         CHECK(user_id1 < user_id2)
@@ -56,8 +68,7 @@ async function initDB() {
         id          SERIAL PRIMARY KEY,
         sender_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         receiver_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        status      VARCHAR(16) NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','accepted','declined')),
+        status      VARCHAR(16) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','declined')),
         created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE(sender_id, receiver_id)
       );
@@ -80,11 +91,11 @@ async function initDB() {
     // ── Group Members ─────────────────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS group_members (
-        id         SERIAL PRIMARY KEY,
-        group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        role       VARCHAR(16) NOT NULL DEFAULT 'member' CHECK (role IN ('admin','member')),
-        joined_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        id        SERIAL PRIMARY KEY,
+        group_id  INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role      VARCHAR(16) NOT NULL DEFAULT 'member' CHECK (role IN ('admin','member')),
+        joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE(group_id, user_id)
       );
     `);
@@ -92,7 +103,6 @@ async function initDB() {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_group_members_user  ON group_members(user_id);`);
 
     // ── Posts ─────────────────────────────────────────────────────────────────
-    // Add group_id column to posts if not already there (safe migration)
     await client.query(`
       CREATE TABLE IF NOT EXISTS posts (
         id         SERIAL PRIMARY KEY,
@@ -102,12 +112,7 @@ async function initDB() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
-    // Safe migration: add group_id if the table already existed without it
-    await client.query(`
-      DO $$ BEGIN
-        ALTER TABLE posts ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE;
-      EXCEPTION WHEN duplicate_column THEN NULL; END $$;
-    `);
+    await client.query(`DO $$ BEGIN ALTER TABLE posts ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`);
 
     // ── Post images ───────────────────────────────────────────────────────────
     await client.query(`
@@ -152,7 +157,7 @@ async function initDB() {
       );
     `);
 
-    // ── Indexes for performance ───────────────────────────────────────────────
+    // ── Indexes ───────────────────────────────────────────────────────────────
     await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_user       ON posts(user_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_group      ON posts(group_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_posts_created    ON posts(created_at DESC);`);
