@@ -89,6 +89,7 @@ app.use(sessionMiddleware);
 // ══════════════════════════════════════════════════════════════════════════════
 const wss = new WebSocketServer({ server });
 const clients = new Map(); // userId → Set<WebSocket>
+const onlineUsers = new Set();
 
 wss.on('connection', (ws, req) => {
   sessionMiddleware(req, {}, () => {
@@ -98,6 +99,8 @@ wss.on('connection', (ws, req) => {
     ws.userId = userId;
     if (!clients.has(userId)) clients.set(userId, new Set());
     clients.get(userId).add(ws);
+    onlineUsers.add(userId);
+    broadcastAll({ type: 'user_online', userId });
 
     ws.on('message', (raw) => {
       try {
@@ -111,7 +114,11 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
       clients.get(userId)?.delete(ws);
-      if (!clients.get(userId)?.size) clients.delete(userId);
+      if (!clients.get(userId)?.size) {
+        clients.delete(userId);
+        onlineUsers.delete(userId);
+        broadcastAll({ type: 'user_offline', userId });
+      }
     });
 
     ws.on('error', () => {});
@@ -959,11 +966,159 @@ app.post('/api/notifications/:id/read', requireAuth, async (req, res) => {
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
+// ── Online users ──────────────────────────────────────────────────────────────
+app.get('/api/online', requireAuth, (req, res) => {
+  res.json({ online: Array.from(onlineUsers) });
+});
+
+// ── Cover photo ───────────────────────────────────────────────────────────────
+app.post('/api/users/me/cover', requireAuth, upload.single('cover'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const url = await uploadToCloudinary(req.file.buffer, 'gsocial/covers');
+    await pool.query('UPDATE users SET cover_url=$1 WHERE id=$2', [url, req.session.userId]);
+    res.json({ cover_url: url });
+  } catch (e) { res.status(500).json({ error: 'Upload failed' }); }
+});
+
+// ── Edit post ─────────────────────────────────────────────────────────────────
+app.put('/api/posts/:id', requireAuth, async (req, res) => {
+  const { content } = req.body;
+  if (!content?.trim()) return res.status(400).json({ error: 'Content required' });
+  try {
+    const r = await pool.query(
+      'UPDATE posts SET content=$1, edited=TRUE WHERE id=$2 AND user_id=$3 RETURNING id',
+      [content.trim(), req.params.id, req.session.userId]
+    );
+    if (!r.rowCount) return res.status(403).json({ error: 'Not authorized or post not found' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Emoji Reactions ───────────────────────────────────────────────────────────
+app.post('/api/posts/:id/react', requireAuth, async (req, res) => {
+  const { emoji } = req.body;
+  const VALID = ['👍','❤️','😂','😮','😢','😡'];
+  if (!VALID.includes(emoji)) return res.status(400).json({ error: 'Invalid emoji' });
+  try {
+    const existing = await pool.query(
+      'SELECT emoji FROM post_reactions WHERE post_id=$1 AND user_id=$2',
+      [req.params.id, req.session.userId]
+    );
+    if (existing.rows[0]?.emoji === emoji) {
+      await pool.query('DELETE FROM post_reactions WHERE post_id=$1 AND user_id=$2', [req.params.id, req.session.userId]);
+    } else {
+      await pool.query(
+        'INSERT INTO post_reactions (post_id,user_id,emoji) VALUES ($1,$2,$3) ON CONFLICT (post_id,user_id) DO UPDATE SET emoji=$3',
+        [req.params.id, req.session.userId, emoji]
+      );
+    }
+    const { rows } = await pool.query(
+      `SELECT emoji, COUNT(*)::int AS cnt, BOOL_OR(user_id=$1) AS reacted FROM post_reactions WHERE post_id=$2 GROUP BY emoji`,
+      [req.session.userId, req.params.id]
+    );
+    res.json({ reactions: rows });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Reports ───────────────────────────────────────────────────────────────────
+app.post('/api/users/:id/report', requireAuth, async (req, res) => {
+  const { reason, details, post_id } = req.body;
+  if (!reason) return res.status(400).json({ error: 'Reason required' });
+  const reportedId = parseInt(req.params.id);
+  if (reportedId === req.session.userId) return res.status(400).json({ error: "Can't report yourself" });
+  try {
+    await pool.query(
+      'INSERT INTO reports (reporter_id,reported_id,reason,details,post_id) VALUES ($1,$2,$3,$4,$5)',
+      [req.session.userId, reportedId, reason, details||null, post_id||null]
+    );
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.get('/api/admin/reports', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT r.id, r.reason, r.details, r.status, r.created_at, r.post_id,
+        rep.id AS reporter_id, rep.first_name AS reporter_first, rep.last_name AS reporter_last, rep.avatar_url AS reporter_avatar,
+        tgt.id AS reported_id, tgt.first_name AS reported_first, tgt.last_name AS reported_last, tgt.avatar_url AS reported_avatar,
+        p.content AS post_content
+      FROM reports r
+      JOIN users rep ON rep.id = r.reporter_id
+      JOIN users tgt ON tgt.id = r.reported_id
+      LEFT JOIN posts p ON p.id = r.post_id
+      ORDER BY r.created_at DESC LIMIT 200
+    `);
+    const unread = rows.filter(r => r.status === 'pending').length;
+    res.json({ reports: rows, unread });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/admin/reports/:id', requireAdmin, async (req, res) => {
+  const { status } = req.body;
+  if (!['pending','reviewed','dismissed'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+  try {
+    await pool.query('UPDATE reports SET status=$1 WHERE id=$2', [status, req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Delete own account ────────────────────────────────────────────────────────
+app.delete('/api/users/me', requireAuth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM users WHERE id=$1', [req.session.userId]);
+    req.session.destroy(() => res.json({ ok: true }));
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Read receipts ─────────────────────────────────────────────────────────────
+app.post('/api/messages/:userId/read', requireAuth, async (req, res) => {
+  try {
+    await pool.query('UPDATE messages SET read=TRUE WHERE sender_id=$1 AND receiver_id=$2 AND read=FALSE', [req.params.userId, req.session.userId]);
+    broadcastTo(parseInt(req.params.userId), { type: 'messages_read', by: req.session.userId });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── DB Migrations ────────────────────────────────────────────────────────────
+async function runMigrations() {
+  const migrations = [
+    `DO $$ BEGIN ALTER TABLE users ADD COLUMN cover_url TEXT; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+    `DO $$ BEGIN ALTER TABLE posts ADD COLUMN edited BOOLEAN NOT NULL DEFAULT FALSE; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+    `DO $$ BEGIN ALTER TABLE messages ADD COLUMN read BOOLEAN NOT NULL DEFAULT FALSE; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+    `CREATE TABLE IF NOT EXISTS post_reactions (
+      id SERIAL PRIMARY KEY,
+      post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      emoji   VARCHAR(10) NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(post_id, user_id)
+    );`,
+    `CREATE INDEX IF NOT EXISTS idx_reactions_post ON post_reactions(post_id);`,
+    `CREATE TABLE IF NOT EXISTS reports (
+      id          SERIAL PRIMARY KEY,
+      reporter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reported_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      post_id     INTEGER REFERENCES posts(id) ON DELETE SET NULL,
+      reason      VARCHAR(100) NOT NULL,
+      details     TEXT,
+      status      VARCHAR(20) NOT NULL DEFAULT 'pending',
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`,
+    `CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status, created_at DESC);`,
+  ];
+  for (const sql of migrations) {
+    try { await pool.query(sql); } catch (e) { console.warn('Migration:', e.message); }
+  }
+  console.log('✅ Migrations done');
+}
+
 // ── Startup ───────────────────────────────────────────────────────────────────
 initDB()
   .then(() => ensureGroupsTables())
   .then(() => ensureNotificationsTable())
   .then(() => ensureStoriesTable())
+  .then(() => runMigrations())
   .then(() => {
     server.listen(PORT, () => console.log('🚀 API + WebSocket on port ' + PORT));
   });
