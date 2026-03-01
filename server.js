@@ -507,6 +507,7 @@ app.post('/api/friends/requests/:id', requireAuth, async (req, res) => {
       return res.json({ ok: true, auto_accepted: true });
     }
     await pool.query(`INSERT INTO friend_requests (sender_id,receiver_id) VALUES ($1,$2)`, [req.session.userId, receiverId]);
+    createNotification(receiverId, req.session.userId, 'friend_request', null);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
@@ -526,6 +527,7 @@ app.post('/api/friends/requests/:id/accept', requireAuth, async (req, res) => {
       [req.session.userId, senderId]
     );
     await client.query('COMMIT');
+    createNotification(senderId, req.session.userId, 'friend_accept', null);
     res.json({ ok: true });
   } catch (e) { await client.query('ROLLBACK'); res.status(500).json({ error: 'Server error' }); }
   finally { client.release(); }
@@ -614,6 +616,9 @@ app.post('/api/posts/:id/like', requireAuth, async (req, res) => {
   try {
     await pool.query('INSERT INTO likes (post_id,user_id) VALUES ($1,$2)', [req.params.id, req.session.userId]);
     const r = await pool.query('SELECT COUNT(*)::int AS count FROM likes WHERE post_id=$1', [req.params.id]);
+    // Notify post owner
+    const postOwner = await pool.query('SELECT user_id FROM posts WHERE id=$1', [req.params.id]);
+    if (postOwner.rows[0]) createNotification(postOwner.rows[0].user_id, req.session.userId, 'like', parseInt(req.params.id));
     res.json({ liked: true, count: r.rows[0].count });
   } catch { res.status(400).json({ error: 'Already liked' }); }
 });
@@ -646,6 +651,9 @@ app.post('/api/posts/:id/comments', requireAuth, async (req, res) => {
       [req.params.id, req.session.userId, content.trim()]
     );
     const user = await getUser(req.session.userId);
+    // Notify post owner
+    const postOwner = await pool.query('SELECT user_id FROM posts WHERE id=$1', [req.params.id]);
+    if (postOwner.rows[0]) createNotification(postOwner.rows[0].user_id, req.session.userId, 'comment', parseInt(req.params.id));
     res.json({ comment: { id: r.rows[0].id, content: content.trim(), created_at: r.rows[0].created_at, user_id: user.id, first_name: user.first_name, last_name: user.last_name, avatar_url: user.avatar_url, role: user.role } });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
@@ -846,12 +854,82 @@ app.post('/api/groups/:id/posts', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  NOTIFICATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function ensureNotificationsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id         SERIAL PRIMARY KEY,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        actor_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type       VARCHAR(30) NOT NULL,  -- 'like','comment','friend_request','friend_accept'
+        post_id    INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+        read       BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id, created_at DESC);
+    `);
+    console.log('✅ Notifications table ready');
+  } catch (e) { console.error('⚠️ ensureNotificationsTable:', e.message); }
+}
+
+async function createNotification(userId, actorId, type, postId = null) {
+  if (userId === actorId) return; // don't notify yourself
+  try {
+    // Avoid duplicate pending notifications (same user+actor+type+post)
+    await pool.query(`
+      INSERT INTO notifications (user_id, actor_id, type, post_id)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT DO NOTHING
+    `, [userId, actorId, type, postId]);
+    // Push real-time notification to that user
+    const actor = await getUser(actorId);
+    broadcastTo(userId, {
+      type: 'notification',
+      notif: { actor_name: actor.first_name + ' ' + actor.last_name, actor_avatar: actor.avatar_url, notif_type: type, post_id: postId }
+    });
+  } catch (e) { console.warn('createNotification error:', e.message); }
+}
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT n.id, n.type, n.post_id, n.read, n.created_at,
+        u.id AS actor_id, u.first_name, u.last_name, u.avatar_url
+      FROM notifications n
+      JOIN users u ON u.id = n.actor_id
+      WHERE n.user_id = $1
+      ORDER BY n.created_at DESC LIMIT 50
+    `, [req.session.userId]);
+    const unread = rows.filter(r => !r.read).length;
+    res.json({ notifications: rows, unread });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/notifications/read', requireAuth, async (req, res) => {
+  try {
+    await pool.query('UPDATE notifications SET read=TRUE WHERE user_id=$1', [req.session.userId]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/api/notifications/:id/read', requireAuth, async (req, res) => {
+  try {
+    await pool.query('UPDATE notifications SET read=TRUE WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 initDB()
   .then(() => ensureGroupsTables())
+  .then(() => ensureNotificationsTable())
   .then(() => {
     server.listen(PORT, () => console.log('🚀 API + WebSocket on port ' + PORT));
   });
