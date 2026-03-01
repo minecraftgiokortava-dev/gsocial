@@ -6,12 +6,26 @@ const bcrypt     = require('bcryptjs');
 const multer     = require('multer');
 const cors       = require('cors');
 const cloudinary = require('cloudinary').v2;
+const https      = require('https');
+const http       = require('http');
 const { pool, initDB } = require('./db');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
 app.set('trust proxy', 1);
+
+// ── Keep-Alive Ping (prevents Render.com free tier from sleeping) ─────────────
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+setInterval(() => {
+  const url = SELF_URL + '/api/health';
+  const lib = url.startsWith('https') ? https : http;
+  lib.get(url, (res) => {
+    console.log(`🏓 Keep-alive ping → ${res.statusCode}`);
+  }).on('error', (err) => {
+    console.warn('Keep-alive ping failed:', err.message);
+  });
+}, 10 * 60 * 1000); // every 10 minutes
 
 // ── Cloudinary ──────────────────────────────────────────────────────────────
 cloudinary.config({ cloudinary_url: process.env.CLOUDINARY_URL });
@@ -58,17 +72,15 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── SESSION FIX: increased maxAge + rolling sessions ─────────────────────────
-// Rolling: true means every request resets the cookie expiry — so users who
-// are actively using the site never get logged out.
+// ── Session ─────────────────────────────────────────────────────────────────
 app.use(session({
   store: new pgSession({ pool, tableName: 'session', createTableIfMissing: false }),
   secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
   resave: false,
   saveUninitialized: false,
-  rolling: true, // ← KEY FIX: resets maxAge on every request, keeps active users logged in
+  rolling: true,
   cookie: {
-    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days (was 7) — longer expiry
+    maxAge: 30 * 24 * 60 * 60 * 1000,
     secure: process.env.NODE_ENV === 'production',
     httpOnly: true,
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
@@ -151,7 +163,6 @@ app.get('/api/users/search', requireAuth, async (req, res) => {
   }
 });
 
-// NOTE: This route must come BEFORE /api/users/:id
 app.get('/api/users/me', requireAuth, async (req, res) => {
   res.json({ user: await getUser(req.session.userId) });
 });
@@ -183,7 +194,6 @@ app.post('/api/users/me/avatar', requireAuth, upload.single('avatar'), async (re
   }
 });
 
-// Per-user posts (for profile page)
 app.get('/api/users/:id/posts', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -214,7 +224,6 @@ app.get('/api/users/:id/posts', requireAuth, async (req, res) => {
 //  FRIENDS & FRIEND REQUESTS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/friends — list confirmed friends
 app.get('/api/friends', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -230,7 +239,6 @@ app.get('/api/friends', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/friends/:id — unfriend
 app.delete('/api/friends/:id', requireAuth, async (req, res) => {
   const friendId = parseInt(req.params.id);
   try {
@@ -245,7 +253,6 @@ app.delete('/api/friends/:id', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/friends/requests — incoming pending requests for current user
 app.get('/api/friends/requests', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -263,13 +270,11 @@ app.get('/api/friends/requests', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/friends/requests/:id — send a friend request to user :id
 app.post('/api/friends/requests/:id', requireAuth, async (req, res) => {
   const receiverId = parseInt(req.params.id);
   if (receiverId === req.session.userId)
     return res.status(400).json({ error: "Can't add yourself" });
   try {
-    // Check if already friends
     const existing = await pool.query(
       `SELECT 1 FROM friendships
        WHERE user_id1 = least($1::int,$2::int) AND user_id2 = greatest($1::int,$2::int)`,
@@ -277,7 +282,6 @@ app.post('/api/friends/requests/:id', requireAuth, async (req, res) => {
     );
     if (existing.rowCount) return res.status(400).json({ error: 'Already friends' });
 
-    // Check if request already sent
     const dup = await pool.query(
       `SELECT 1 FROM friend_requests
        WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'`,
@@ -285,7 +289,6 @@ app.post('/api/friends/requests/:id', requireAuth, async (req, res) => {
     );
     if (dup.rowCount) return res.status(400).json({ error: 'Request already sent' });
 
-    // Check if the other person already sent us a request — auto-accept
     const reverse = await pool.query(
       `SELECT id FROM friend_requests
        WHERE sender_id=$1 AND receiver_id=$2 AND status='pending'`,
@@ -316,7 +319,6 @@ app.post('/api/friends/requests/:id', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/friends/requests/:id/accept — accept incoming request from user :id
 app.post('/api/friends/requests/:id/accept', requireAuth, async (req, res) => {
   const senderId = parseInt(req.params.id);
   const client = await pool.connect();
@@ -349,7 +351,6 @@ app.post('/api/friends/requests/:id/accept', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/friends/requests/:id/decline — decline/delete request from user :id
 app.post('/api/friends/requests/:id/decline', requireAuth, async (req, res) => {
   const senderId = parseInt(req.params.id);
   try {
@@ -602,10 +603,40 @@ app.post('/api/messages/:userId', requireAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  GROUPS
+//  GROUPS — fixed with explicit DB table creation check
 // ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/groups — list all groups with membership status
+// Ensure groups tables exist (safe to run every startup)
+async function ensureGroupsTables() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS groups (
+        id          SERIAL PRIMARY KEY,
+        name        VARCHAR(100) NOT NULL,
+        description TEXT,
+        privacy     VARCHAR(20)  NOT NULL DEFAULT 'public',
+        emoji       VARCHAR(10)  NOT NULL DEFAULT '👥',
+        creator_id  INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS group_members (
+        group_id    INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role        VARCHAR(20) NOT NULL DEFAULT 'member',
+        joined_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (group_id, user_id)
+      );
+      -- Add group_id column to posts if it doesn't exist
+      DO $$ BEGIN
+        ALTER TABLE posts ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE;
+      EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+    `);
+    console.log('✅ Groups tables ready');
+  } catch (e) {
+    console.error('⚠️  ensureGroupsTables error:', e.message);
+  }
+}
+
 app.get('/api/groups', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -625,7 +656,6 @@ app.get('/api/groups', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/groups/:id — single group detail
 app.get('/api/groups/:id', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -645,7 +675,6 @@ app.get('/api/groups/:id', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/groups — create a group
 app.post('/api/groups', requireAuth, async (req, res) => {
   const { name, description, privacy, emoji } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Group name required' });
@@ -658,7 +687,6 @@ app.post('/api/groups', requireAuth, async (req, res) => {
       [name.trim(), description?.trim() || null, privacy || 'public', emoji || '👥', req.session.userId]
     );
     const groupId = r.rows[0].id;
-    // Creator auto-joins as admin
     await client.query(
       `INSERT INTO group_members (group_id, user_id, role) VALUES ($1,$2,'admin')`,
       [groupId, req.session.userId]
@@ -673,13 +701,12 @@ app.post('/api/groups', requireAuth, async (req, res) => {
   } catch (e) {
     await client.query('ROLLBACK');
     console.error(e);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Server error: ' + e.message });
   } finally {
     client.release();
   }
 });
 
-// POST /api/groups/:id/join — join a group
 app.post('/api/groups/:id/join', requireAuth, async (req, res) => {
   try {
     await pool.query(
@@ -692,7 +719,6 @@ app.post('/api/groups/:id/join', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/groups/:id/join — leave a group
 app.delete('/api/groups/:id/join', requireAuth, async (req, res) => {
   try {
     await pool.query(
@@ -705,7 +731,6 @@ app.delete('/api/groups/:id/join', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/groups/:id/members — list members
 app.get('/api/groups/:id/members', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -721,7 +746,6 @@ app.get('/api/groups/:id/members', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/groups/:id/posts — get posts in a group
 app.get('/api/groups/:id/posts', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -745,12 +769,10 @@ app.get('/api/groups/:id/posts', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/groups/:id/posts — post in a group (must be member)
 app.post('/api/groups/:id/posts', requireAuth, async (req, res) => {
   const { content } = req.body;
   if (!content?.trim()) return res.status(400).json({ error: 'Post cannot be empty' });
   try {
-    // Check membership
     const mem = await pool.query(
       `SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2`,
       [req.params.id, req.session.userId]
@@ -768,8 +790,10 @@ app.post('/api/groups/:id/posts', requireAuth, async (req, res) => {
 });
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-initDB().then(() => {
-  app.listen(PORT, () => console.log('🚀 API on port ' + PORT));
-});
+initDB()
+  .then(() => ensureGroupsTables())
+  .then(() => {
+    app.listen(PORT, () => console.log('🚀 API on port ' + PORT));
+  });
