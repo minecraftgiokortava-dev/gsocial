@@ -155,8 +155,6 @@ async function getUser(id) {
 }
 
 // ── Mr Frozy privilege helper ─────────────────────────────────────────────────
-// Automatically ensures the account "Mr Frozy" always has admin role.
-// Called after signup and after login.
 async function ensureMrFrozyIsAdmin(userId) {
   try {
     await pool.query(
@@ -197,10 +195,7 @@ app.post('/api/auth/signup', async (req, res) => {
     );
     const newUserId = r.rows[0].id;
     req.session.userId = newUserId;
-
-    // ── Grant admin to Mr Frozy on signup ──
     await ensureMrFrozyIsAdmin(newUserId);
-
     req.session.save(async () => res.json({ user: await getUser(req.session.userId) }));
   } catch (e) {
     if (e.code === '23505') return res.status(400).json({ error: 'Email already registered' });
@@ -218,10 +213,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(400).json({ error: 'Invalid email/password' });
     req.session.userId = user.id;
-
-    // ── Grant admin to Mr Frozy on every login ──
     await ensureMrFrozyIsAdmin(user.id);
-
     req.session.save(async () => res.json({ user: await getUser(user.id) }));
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
@@ -253,10 +245,7 @@ app.post('/api/announcements', requireAdmin, async (req, res) => {
   if (!content?.trim()) return res.status(400).json({ error: 'Content required' });
   try {
     await pool.query('UPDATE announcements SET active=FALSE WHERE active=TRUE');
-    await pool.query(
-      'INSERT INTO announcements (content, created_by) VALUES ($1,$2)',
-      [content.trim(), req.session.userId]
-    );
+    await pool.query('INSERT INTO announcements (content, created_by) VALUES ($1,$2)', [content.trim(), req.session.userId]);
     broadcastAll({ type: 'announcement', content: content.trim() });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
@@ -284,7 +273,6 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
       );
       rows = r.rows;
     } catch (qe) {
-      // Fallback without post_count if posts table has issues
       console.warn('Admin users full query failed, using fallback:', qe.message);
       const r = await pool.query(
         `SELECT id, first_name, last_name, email, role, avatar_url, created_at, 0 AS post_count
@@ -317,7 +305,6 @@ app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
 
 app.get('/api/admin/posts', requireAdmin, async (req, res) => {
   try {
-    // Try full query with images first
     let rows;
     try {
       const r = await pool.query(`
@@ -337,7 +324,6 @@ app.get('/api/admin/posts', requireAdmin, async (req, res) => {
       `);
       rows = r.rows;
     } catch (qe) {
-      // Fallback: skip post_images if table doesn't exist yet
       console.warn('Admin posts full query failed, using fallback:', qe.message);
       const r = await pool.query(`
         SELECT p.id, p.content, p.created_at,
@@ -394,7 +380,6 @@ app.get('/api/users/:id', requireAuth, async (req, res) => {
 app.put('/api/users/me', requireAuth, async (req, res) => {
   const { first_name, last_name, bio } = req.body;
   if (!first_name || !last_name) return res.status(400).json({ error: 'Name fields required' });
-
   try {
     const nameCheck = await pool.query(
       `SELECT id FROM users WHERE LOWER(first_name || ' ' || last_name) = LOWER($1) AND id != $2`,
@@ -402,7 +387,6 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
     );
     if (nameCheck.rowCount > 0)
       return res.status(400).json({ error: `The name "${first_name.trim()} ${last_name.trim()}" is already taken.` });
-
     await pool.query(
       'UPDATE users SET first_name=$1, last_name=$2, bio=$3 WHERE id=$4',
       [first_name.trim(), last_name.trim(), bio || null, req.session.userId]
@@ -616,7 +600,6 @@ app.post('/api/posts/:id/like', requireAuth, async (req, res) => {
   try {
     await pool.query('INSERT INTO likes (post_id,user_id) VALUES ($1,$2)', [req.params.id, req.session.userId]);
     const r = await pool.query('SELECT COUNT(*)::int AS count FROM likes WHERE post_id=$1', [req.params.id]);
-    // Notify post owner
     const postOwner = await pool.query('SELECT user_id FROM posts WHERE id=$1', [req.params.id]);
     if (postOwner.rows[0]) createNotification(postOwner.rows[0].user_id, req.session.userId, 'like', parseInt(req.params.id));
     res.json({ liked: true, count: r.rows[0].count });
@@ -651,7 +634,6 @@ app.post('/api/posts/:id/comments', requireAuth, async (req, res) => {
       [req.params.id, req.session.userId, content.trim()]
     );
     const user = await getUser(req.session.userId);
-    // Notify post owner
     const postOwner = await pool.query('SELECT user_id FROM posts WHERE id=$1', [req.params.id]);
     if (postOwner.rows[0]) createNotification(postOwner.rows[0].user_id, req.session.userId, 'comment', parseInt(req.params.id));
     res.json({ comment: { id: r.rows[0].id, content: content.trim(), created_at: r.rows[0].created_at, user_id: user.id, first_name: user.first_name, last_name: user.last_name, avatar_url: user.avatar_url, role: user.role } });
@@ -716,11 +698,71 @@ app.post('/api/messages/:userId', requireAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  STORIES  (24-hour expiring stories with images)
+// ══════════════════════════════════════════════════════════════════════════════
+async function ensureStoriesTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS stories (
+        id         SERIAL PRIMARY KEY,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        image_url  TEXT    NOT NULL,
+        caption    TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours')
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_stories_user    ON stories(user_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_stories_expires ON stories(expires_at);`);
+    console.log('✅ Stories table ready');
+  } catch (e) { console.error('⚠️ ensureStoriesTable:', e.message); }
+}
+
+// GET all active (non-expired) stories — most recent per user
+app.get('/api/stories', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT DISTINCT ON (s.user_id)
+        s.id, s.user_id, s.image_url, s.caption, s.created_at, s.expires_at,
+        u.first_name, u.last_name, u.avatar_url, u.role
+      FROM stories s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.expires_at > NOW()
+      ORDER BY s.user_id, s.created_at DESC
+    `);
+    res.json({ stories: rows });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST create a story (image required)
+app.post('/api/stories', requireAuth, upload.single('image'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Image required' });
+  try {
+    const image_url = await uploadToCloudinary(req.file.buffer, 'gsocial/stories');
+    const caption = req.body.caption?.trim() || null;
+    const r = await pool.query(
+      'INSERT INTO stories (user_id, image_url, caption) VALUES ($1,$2,$3) RETURNING *',
+      [req.session.userId, image_url, caption]
+    );
+    const user = await getUser(req.session.userId);
+    broadcastAll({ type: 'new_story', story: { ...r.rows[0], first_name: user.first_name, last_name: user.last_name, avatar_url: user.avatar_url } });
+    res.json({ story: { ...r.rows[0], first_name: user.first_name, last_name: user.last_name, avatar_url: user.avatar_url } });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE own story
+app.delete('/api/stories/:id', requireAuth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM stories WHERE id=$1 AND user_id=$2', [req.params.id, req.session.userId]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  GROUPS
 // ══════════════════════════════════════════════════════════════════════════════
 async function ensureGroupsTables() {
   try {
-    // ── Create groups table ──────────────────────────────────────────────────
     await pool.query(`
       CREATE TABLE IF NOT EXISTS groups (
         id         SERIAL PRIMARY KEY,
@@ -729,8 +771,6 @@ async function ensureGroupsTables() {
         created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
       );
     `);
-
-    // ── Create group_members table (UNIQUE instead of composite PK) ──────────
     await pool.query(`
       CREATE TABLE IF NOT EXISTS group_members (
         id        SERIAL PRIMARY KEY,
@@ -741,8 +781,6 @@ async function ensureGroupsTables() {
         UNIQUE(group_id, user_id)
       );
     `);
-
-    // ── Safe column migrations (idempotent, run every boot) ──────────────────
     const migrations = [
       `DO $$ BEGIN ALTER TABLE groups ADD COLUMN description TEXT; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
       `DO $$ BEGIN ALTER TABLE groups ADD COLUMN privacy VARCHAR(20) NOT NULL DEFAULT 'public'; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
@@ -754,10 +792,8 @@ async function ensureGroupsTables() {
       `CREATE INDEX IF NOT EXISTS idx_group_members_user  ON group_members(user_id);`,
     ];
     for (const sql of migrations) {
-      try { await pool.query(sql); }
-      catch (me) { console.warn('Migration warning:', me.message); }
+      try { await pool.query(sql); } catch (me) { console.warn('Migration warning:', me.message); }
     }
-
     console.log('✅ Groups tables ready');
   } catch (e) { console.error('⚠️ ensureGroupsTables FATAL:', e.message); }
 }
@@ -827,7 +863,7 @@ app.get('/api/groups/:id/members', requireAuth, async (req, res) => {
       WHERE gm.group_id=$1 ORDER BY gm.role='admin' DESC, gm.joined_at ASC
     `, [req.params.id]);
     res.json({ members: rows });
-  } catch (e) { console.error('GET /api/groups/:id/members error:', e); res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/groups/:id/posts', requireAuth, async (req, res) => {
@@ -857,7 +893,6 @@ app.post('/api/groups/:id/posts', requireAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 //  NOTIFICATIONS
 // ══════════════════════════════════════════════════════════════════════════════
-
 async function ensureNotificationsTable() {
   try {
     await pool.query(`
@@ -865,7 +900,7 @@ async function ensureNotificationsTable() {
         id         SERIAL PRIMARY KEY,
         user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         actor_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        type       VARCHAR(30) NOT NULL,  -- 'like','comment','friend_request','friend_accept'
+        type       VARCHAR(30) NOT NULL,
         post_id    INTEGER REFERENCES posts(id) ON DELETE CASCADE,
         read       BOOLEAN NOT NULL DEFAULT FALSE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -877,15 +912,13 @@ async function ensureNotificationsTable() {
 }
 
 async function createNotification(userId, actorId, type, postId = null) {
-  if (userId === actorId) return; // don't notify yourself
+  if (userId === actorId) return;
   try {
-    // Avoid duplicate pending notifications (same user+actor+type+post)
     await pool.query(`
       INSERT INTO notifications (user_id, actor_id, type, post_id)
       VALUES ($1,$2,$3,$4)
       ON CONFLICT DO NOTHING
     `, [userId, actorId, type, postId]);
-    // Push real-time notification to that user
     const actor = await getUser(actorId);
     broadcastTo(userId, {
       type: 'notification',
@@ -930,6 +963,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true, ts: new Date().toISOSt
 initDB()
   .then(() => ensureGroupsTables())
   .then(() => ensureNotificationsTable())
+  .then(() => ensureStoriesTable())
   .then(() => {
     server.listen(PORT, () => console.log('🚀 API + WebSocket on port ' + PORT));
   });
