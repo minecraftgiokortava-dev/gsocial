@@ -281,7 +281,7 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
        FROM users ORDER BY created_at DESC`
     );
     res.json({ users: rows });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { console.error('GET /api/admin/users error:', e); res.status(500).json({ error: e.message }); }
 });
 
 app.put('/api/admin/users/:id/role', requireAdmin, async (req, res) => {
@@ -321,7 +321,7 @@ app.get('/api/admin/posts', requireAdmin, async (req, res) => {
       ORDER BY p.created_at DESC LIMIT 200
     `);
     res.json({ posts: rows });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { console.error('GET /api/admin/posts error:', e); res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/admin/posts/:id', requireAdmin, async (req, res) => {
@@ -678,32 +678,46 @@ app.post('/api/messages/:userId', requireAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 async function ensureGroupsTables() {
   try {
-    // Create tables if they don't exist yet
+    // ── Create groups table ──────────────────────────────────────────────────
     await pool.query(`
       CREATE TABLE IF NOT EXISTS groups (
-        id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL,
+        id         SERIAL PRIMARY KEY,
+        name       VARCHAR(100) NOT NULL,
         creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS group_members (
-        group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        role VARCHAR(20) NOT NULL DEFAULT 'member', joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (group_id, user_id)
+        created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
       );
     `);
 
-    // ── Safe column migrations (add if missing) ───────────────────────────────
+    // ── Create group_members table (UNIQUE instead of composite PK) ──────────
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS group_members (
+        id        SERIAL PRIMARY KEY,
+        group_id  INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role      VARCHAR(20) NOT NULL DEFAULT 'member',
+        joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(group_id, user_id)
+      );
+    `);
+
+    // ── Safe column migrations (idempotent, run every boot) ──────────────────
     const migrations = [
       `DO $$ BEGIN ALTER TABLE groups ADD COLUMN description TEXT; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
       `DO $$ BEGIN ALTER TABLE groups ADD COLUMN privacy VARCHAR(20) NOT NULL DEFAULT 'public'; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
       `DO $$ BEGIN ALTER TABLE groups ADD COLUMN emoji VARCHAR(10) NOT NULL DEFAULT '👥'; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+      `DO $$ BEGIN ALTER TABLE group_members ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'member'; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+      `DO $$ BEGIN ALTER TABLE group_members ADD COLUMN joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(); EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
       `DO $$ BEGIN ALTER TABLE posts ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE; EXCEPTION WHEN duplicate_column THEN NULL; END $$;`,
+      `CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_group_members_user  ON group_members(user_id);`,
     ];
-    for (const sql of migrations) await pool.query(sql);
+    for (const sql of migrations) {
+      try { await pool.query(sql); }
+      catch (me) { console.warn('Migration warning:', me.message); }
+    }
 
     console.log('✅ Groups tables ready');
-  } catch (e) { console.error('⚠️ ensureGroupsTables:', e.message); }
+  } catch (e) { console.error('⚠️ ensureGroupsTables FATAL:', e.message); }
 }
 
 app.get('/api/groups', requireAuth, async (req, res) => {
@@ -771,7 +785,7 @@ app.get('/api/groups/:id/members', requireAuth, async (req, res) => {
       WHERE gm.group_id=$1 ORDER BY gm.role='admin' DESC, gm.joined_at ASC
     `, [req.params.id]);
     res.json({ members: rows });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) { console.error('GET /api/groups/:id/members error:', e); res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/groups/:id/posts', requireAuth, async (req, res) => {
